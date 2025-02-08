@@ -15,6 +15,7 @@ import numpy as np
 import os
 from scipy import signal as scipy_signal
 import signal
+import soxr
 from time import time as ttime
 from tools.my_utils import load_audio
 import torch
@@ -332,9 +333,9 @@ def get_tts_audio(
     prompt_language,
     text,
     text_language,
-    top_k=20,
-    top_p=0.6,
-    temperature=0.6,
+    top_k=15,
+    top_p=1,
+    temperature=1,
     speed=1,
 ):
     """
@@ -382,7 +383,7 @@ def get_tts_audio(
     t1 = ttime()
     t.append(t1 - t0)
 
-    text = cut(text)
+    # text = cut(text)
 
     while "\n\n" in text:
         text = text.replace("\n\n", "\n")
@@ -462,6 +463,111 @@ def get_tts_audio(
     print("%.3f\t%.3f\t%.3f\t%.3f" % (t[0], sum(t[1::3]), sum(t[2::3]), sum(t[3::3])))
 
     yield hps.data.sampling_rate, np.concatenate(audio_output, 0).astype(np.float64)
+
+
+def trim_silence(audio_data, threshold_db=-40, window_size=1024):
+    """
+    Trim silence from the beginning and end of audio data based on dB threshold.
+    audio_data (np.ndarray): dtype float64.
+    """
+
+    # Convert amplitude to dB.
+    def to_db(x):
+        # Add small number to prevent log of 0.
+        return 20 * np.log10(np.abs(x) + 1e-10)
+
+    # Calculate dB values for each window.
+    def get_window_db(data, start_idx):
+        end_idx = min(start_idx + window_size, len(data))
+        window = data[start_idx:end_idx]
+
+        return np.max(to_db(window))
+
+    # Find start index (first window above threshold)
+    start_idx = 0
+
+    while start_idx < len(audio_data):
+        if get_window_db(audio_data, start_idx) > threshold_db:
+            break
+
+        start_idx += window_size
+
+    # Find end index (last window above threshold)
+    end_idx = len(audio_data)
+
+    while end_idx > start_idx:
+        if get_window_db(audio_data, max(0, end_idx - window_size)) > threshold_db:
+            break
+
+        end_idx -= window_size
+
+    # Return trimmed audio.
+    return audio_data[start_idx:end_idx]
+
+
+def normalize_audio(audio_data, target_db=-1.0):
+    """
+    Normalize the gain of given audio. (dtype=float64)
+    """
+
+    # Find the peak amplitude.
+    peak_amplitude = np.max(np.abs(audio_data))
+
+    # Convert target dB to amplitude.
+    target_amplitude = 10 ** (target_db / 20.0)
+
+    # Calculate scaling factor.
+    scaling_factor = target_amplitude / peak_amplitude
+
+    # Apply normalization.
+    normalized_audio = audio_data * scaling_factor
+
+    # Ensure we do not exceed [-1, 1] range.
+    normalized_audio = np.clip(normalized_audio, -1.0, 1.0)
+
+    return normalized_audio
+
+
+def process_audio_soxr(
+    audio_data,
+    original_sample_rate=32000,
+    target_sample_rate=48000,
+):
+    """
+    Process PCM audio data using SOXR library.
+    """
+
+    t1 = ttime()
+
+    trimmed_audio = trim_silence(audio_data)
+
+    t2 = ttime()
+
+    normalized_audio = normalize_audio(trimmed_audio)
+
+    t3 = ttime()
+
+    resampled_audio = soxr.resample(
+        normalized_audio, original_sample_rate, target_sample_rate, quality="HQ"
+    )
+
+    t4 = ttime()
+
+    print(
+        "Trim: %.3f, Normalize: %.3f, Resample: %.3f"
+        % ((t2 - t1), (t3 - t2), (t4 - t3))
+    )
+
+    # Convert to int16.
+    resampled_audio = (resampled_audio * 32768).astype(np.int16)
+
+    # Convert to stereo if needed.
+    if len(resampled_audio.shape) == 1:
+        stereo_audio = np.column_stack((resampled_audio, resampled_audio))
+
+        return stereo_audio
+    else:
+        return resampled_audio
 
 
 def lanczos_kernel(x, a=3):
@@ -567,7 +673,6 @@ def process_audio(
     Return it in 16-bit PCM stereo.
     """
 
-    t = []
     t1 = ttime()
 
     # Normalize to [-1, 1] range if needed.
@@ -617,7 +722,7 @@ def pack_audio(io_buffer: BytesIO, data: np.ndarray):
     Pack ndarray audio into BytesIO.
     """
 
-    data = process_audio(data)
+    data = process_audio_soxr(data)
     io_buffer.write(data.tobytes())
     io_buffer.seek(0)
 
@@ -630,9 +735,9 @@ def tts(
     prompt_language,
     text,
     text_language,
-    top_k=20,
-    top_p=0.6,
-    temperature=0.6,
+    top_k=15,
+    top_p=1,
+    temperature=1,
     speed=1,
 ):
     """
